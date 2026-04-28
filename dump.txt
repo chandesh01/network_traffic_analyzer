@@ -1,0 +1,472 @@
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\analyzer.py
+=========================================
+from collections import deque, defaultdict
+import time
+import heapq
+
+
+class Analyzer:
+    def __init__(self, protocol_filter=None, port_filter=None, local_ip=None):
+        self.protocol_filter = protocol_filter
+        self.port_filter = port_filter
+        self.local_ip = local_ip
+
+        self.ip_count = defaultdict(int)
+        self.dest_count = defaultdict(int)
+
+        self.packet_count = 0
+        self.start_time = time.time()
+
+        self.connections = set()
+        self.peers = set()
+
+        # protocol counters
+        self.tcp = 0
+        self.udp = 0
+        self.icmp = 0
+
+        # service counters
+        self.http = 0
+        self.https = 0
+        self.dns = 0
+        self.quic = 0
+
+        self.recent = deque(maxlen=10)
+
+        # ✅ cached top results (optimization)
+        self.top_sources = []
+        self.top_destinations = []
+
+    # ------------------------------
+
+    def match_filter(self, packet):
+        proto = packet.get("protocol")
+        sport = packet.get("sport")
+        dport = packet.get("dport")
+
+        if self.protocol_filter:
+            if not proto or proto.lower() != self.protocol_filter.lower():
+                return False
+
+        if self.port_filter:
+            if sport != self.port_filter and dport != self.port_filter:
+                return False
+
+        return True
+
+    # ------------------------------
+
+    def process(self, packet):
+        if not self.match_filter(packet):
+            return
+
+        src = packet.get("src")
+        dst = packet.get("dst")
+        sport = packet.get("sport")
+        dport = packet.get("dport")
+        proto = packet.get("protocol")
+        service = packet.get("service")
+
+        if not src or not dst:
+            return
+
+        # counts
+        self.ip_count[src] += 1
+        self.packet_count += 1
+
+        if self.local_ip and dst != self.local_ip:
+            self.dest_count[dst] += 1
+
+        # peers
+        self.peers.add(src)
+        self.peers.add(dst)
+
+        # connections (flow-based)
+        conn = tuple(sorted([
+            f"{src}:{sport}",
+            f"{dst}:{dport}"
+        ]))
+        self.connections.add(conn)
+
+        # protocol counters
+        if proto == "TCP":
+            self.tcp += 1
+        elif proto == "UDP":
+            self.udp += 1
+        elif proto == "ICMP":
+            self.icmp += 1
+
+        # service counters
+        if service == "HTTP":
+            self.http += 1
+        elif service == "HTTPS":
+            self.https += 1
+        elif service == "DNS":
+            self.dns += 1
+        elif service == "QUIC":
+            self.quic += 1
+
+        # recent packets
+        self.recent.append(packet)
+
+        # ✅ update top (efficient for small k)
+        self.top_sources = heapq.nlargest(3, self.ip_count.items(), key=lambda x: x[1])
+        self.top_destinations = heapq.nlargest(3, self.dest_count.items(), key=lambda x: x[1])
+
+    # ------------------------------
+
+    def get_stats(self):
+        elapsed = time.time() - self.start_time
+        rate = self.packet_count / elapsed if elapsed > 0 else 0
+
+        return {
+            "tcp": self.tcp,
+            "udp": self.udp,
+            "icmp": self.icmp,
+            "http": self.http,
+            "https": self.https,
+            "dns": self.dns,
+            "quic": self.quic,
+
+            "recent": list(self.recent),
+
+            # ✅ use cached values (no sorting here)
+            "top": self.top_sources,
+            "top_dest": self.top_destinations,
+
+            "rate": round(rate, 2),
+            "connections": len(self.connections),
+            "peers": len(self.peers),
+        }
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\dump.py
+=========================================
+import argparse
+from scapy.all import sniff
+from scapy.layers.inet import IP, UDP
+from scapy.packet import Raw
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", required=True, help="source IP")
+    parser.add_argument("--dst", required=True, help="destination IP")
+    return parser.parse_args()
+
+
+def hexdump(data, width=16):
+    for i in range(0, len(data), width):
+        chunk = data[i:i+width]
+        hex_part = ' '.join(f"{b:02x}" for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        print(f"{i:04x}  {hex_part:<48}  {ascii_part}")
+
+
+def packet_callback(packet, src_filter, dst_filter):
+    if not packet.haslayer(IP):
+        return
+
+    ip = packet[IP]
+
+    # Match both directions
+    if not (
+        (ip.src == src_filter and ip.dst == dst_filter) or
+        (ip.src == dst_filter and ip.dst == src_filter)
+    ):
+        return
+
+    if not packet.haslayer(Raw):
+        return
+
+    data = packet[Raw].load
+
+    # Skip tiny/noise packets
+    if len(data) < 20:
+        return
+
+    #  Direction
+    direction = "OUT" if ip.src == src_filter else "IN"
+
+    # Protocol detection
+    protocol = "TCP/Other"
+    if packet.haslayer(UDP):
+        if packet[UDP].sport == 443 or packet[UDP].dport == 443:
+            protocol = "QUIC"
+        else:
+            protocol = "UDP"
+    else:
+        protocol = "TCP"
+
+    print("\n====== PAYLOAD DUMP ======")
+    print(f"Flow: {src_filter} ↔ {dst_filter}")
+    print(f"[{direction}] {ip.src} → {ip.dst}")
+    print(f"Protocol: {protocol}")
+    print(f"Size: {len(data)} bytes\n")
+
+    hexdump(data[:128])
+
+
+def start_dump(src, dst):
+    sniff(
+        prn=lambda pkt: packet_callback(pkt, src, dst),
+        store=False
+    )
+
+
+if __name__ == "__main__":
+    args = get_args()
+    print(f"Starting dump for {args.src} ↔ {args.dst}...\n")
+    start_dump(args.src, args.dst)
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\hostinfo.py
+=========================================
+import socket
+import uuid
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "Unknown"
+
+
+def get_mac():
+    mac = uuid.getnode()
+    return ':'.join(f"{(mac >> ele) & 0xff:02x}" for ele in range(40, -1, -8))
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\logger.py
+=========================================
+class Logger:
+    def __init__(self, filename="capture.log"):
+        self.file = open(filename, "a", encoding="utf-8")
+
+    def log(self, text):
+        self.file.write(text + "\n")
+        self.file.flush()
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\main.py
+=========================================
+import time
+import argparse
+import threading
+
+from analyzer import Analyzer
+from sniffer import start_sniffing
+from logger import Logger
+from hostinfo import get_local_ip, get_mac
+
+logger = Logger()
+local_ip = get_local_ip()
+mac = get_mac()
+seen = set()
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--protocol", type=str, help="tcp/udp/icmp")
+    parser.add_argument("--port", type=int, help="port number")
+    return parser.parse_args()
+
+def format_packet(p):
+    sport = p["sport"] if p["sport"] else "-"
+    dport = p["dport"] if p["dport"] else "-"
+
+    # Only real HTTP requests
+    if p["service"] == "HTTP" and p["method"]:
+        host = p["host"] if p["host"] else p["dst"]
+        return f"[HTTP ] {p['src']} → {host} ({p['method']})"
+
+    # fallback (non-HTTP payload)
+    return f"[{p['protocol']:<5}] {p['src']}:{sport} → {p['dst']}:{dport}"
+
+def display(analyzer):
+    while True:
+        stats = analyzer.get_stats()
+
+        print("\033c", end="")  # clear screen
+
+        print("====== NetScope ======\n")
+
+
+
+        print(f"Packets/sec: {stats['rate']}\n")
+        print(f"TCP: {stats['tcp']}   UDP: {stats['udp']}   ICMP: {stats['icmp']}")
+        print(f"HTTP: {stats['http']}   HTTPS: {stats['https']}   QUIC: {stats['quic']}   DNS: {stats['dns']}\n")
+
+        print("====== HOST INFO ======\n")
+
+        print(f"Local IP: {local_ip}")
+        print(f"MAC: {mac}")
+        print(f"Active Connections: {stats['connections']}")
+        print(f"Unique Peers: {stats['peers']}\n")
+
+        print("Top Destinations:")
+        for ip, count in stats["top_dest"]:
+            print(f"{ip} → {count} packets")
+
+        print("\nTop Sources:")
+        for ip, count in stats["top"]:
+            print(f"{ip} → {count} packets\n")
+
+        print("Recent Packets:")
+        for p in stats["recent"]:
+            line = format_packet(p)
+            print(line)
+            if line not in seen:
+                logger.log(line)
+                seen.add(line)
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    args = get_args()
+
+    analyzer = Analyzer(
+        protocol_filter=args.protocol,
+        port_filter=args.port,
+        local_ip=local_ip
+    )
+
+    # pass analyzer into sniffer
+    t = threading.Thread(
+        target=start_sniffing,
+        args=(analyzer,),   # ✅ IMPORTANT
+        daemon=True
+    )
+    t.start()
+
+    display(analyzer)
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\parser.py
+=========================================
+from scapy.layers.inet import IP, TCP, UDP, ICMP
+from scapy.packet import Raw
+
+
+def detect_service(protocol, sport, dport):
+    ports = {sport, dport}
+
+    if 80 in ports:
+        return "HTTP"
+    elif 443 in ports:
+        if protocol == "UDP":
+            return "QUIC"
+        return "HTTPS"
+    elif 53 in ports:
+        return "DNS"
+    else:
+        return protocol
+
+
+def extract_http_info(packet):
+    if not packet.haslayer(Raw):
+        return None, None
+
+    try:
+        payload = packet[Raw].load.decode(errors="ignore")
+
+        lines = payload.split("\r\n")
+
+        if len(lines) > 0:
+            first_line = lines[0]
+
+            # Detect GET / POST
+            if first_line.startswith("GET") or first_line.startswith("POST"):
+                method = first_line.split()[0]
+
+                host = None
+                for line in lines:
+                    if line.lower().startswith("host:"):
+                        host = line.split(":", 1)[1].strip()
+                        break
+
+                return method, host
+
+    except:
+        pass
+
+    return None, None
+
+
+def parse_packet(packet):
+    if not packet.haslayer(IP):
+        return None
+
+    ip_layer = packet[IP]
+
+    src = ip_layer.src
+    dst = ip_layer.dst
+
+    protocol = None
+    sport = None
+    dport = None
+
+    if packet.haslayer(TCP):
+        protocol = "TCP"
+        sport = packet[TCP].sport
+        dport = packet[TCP].dport
+
+    elif packet.haslayer(UDP):
+        protocol = "UDP"
+        sport = packet[UDP].sport
+        dport = packet[UDP].dport
+
+    elif packet.haslayer(ICMP):
+        protocol = "ICMP"
+
+    service = detect_service(protocol, sport, dport)
+
+    method, host = None, None
+
+    if service == "HTTP":
+        method, host = extract_http_info(packet)
+
+    return {
+        "src": src,
+        "dst": dst,
+        "protocol": protocol,
+        "sport": sport,
+        "dport": dport,
+        "service": service,
+        "method": method,
+        "host": host
+    }
+
+
+
+=========================================
+FILE: C:\Users\Chandesh\Documents\GitHub\network_traffic_analyzer\src\sniffer.py
+=========================================
+from scapy.all import sniff
+from parser import parse_packet
+
+def start_sniffing(analyzer):
+    def packet_callback(packet):
+        parsed = parse_packet(packet)
+        if parsed:
+            analyzer.process(parsed)
+
+    sniff(prn=packet_callback, store=False)
+
+
