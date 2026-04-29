@@ -31,7 +31,7 @@ class Analyzer:
 
         self.recent = deque(maxlen=10)
 
-        # ✅ cached top results (optimization)
+        # cached top results (optimization)
         self.top_sources = []
         self.top_destinations = []
 
@@ -107,7 +107,7 @@ class Analyzer:
         # recent packets
         self.recent.append(packet)
 
-        # ✅ update top (efficient for small k)
+        # update top (efficient for small k)
         self.top_sources = heapq.nlargest(3, self.ip_count.items(), key=lambda x: x[1])
         self.top_destinations = heapq.nlargest(3, self.dest_count.items(), key=lambda x: x[1])
 
@@ -128,7 +128,7 @@ class Analyzer:
 
             "recent": list(self.recent),
 
-            # ✅ use cached values (no sorting here)
+            # use cached values (no sorting here)
             "top": self.top_sources,
             "top_dest": self.top_destinations,
 
