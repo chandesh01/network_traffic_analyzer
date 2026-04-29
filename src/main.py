@@ -81,7 +81,7 @@ if __name__ == "__main__":
     # pass analyzer into sniffer
     t = threading.Thread(
         target=start_sniffing,
-        args=(analyzer,),   # ✅ IMPORTANT
+        args=(analyzer,),
         daemon=True
     )
     t.start()
